@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../data/models/place_model.dart';
+import '../../../directions/presentation/screens/navigation_screen.dart';
 
 class PlaceResultCard extends StatelessWidget {
   final PlaceModel place;
@@ -47,11 +48,12 @@ class PlaceResultCard extends StatelessWidget {
               width: double.infinity,
               child: OutlinedButton.icon(
                 onPressed: () {
-                  // Placeholder: aquí conectaremos /api/directions
-                  // cuando construyamos el módulo de navegación.
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('La navegación se conectará próximamente'),
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (context) => NavigationScreen(
+                        placeId: place.id,
+                        placeName: place.name,
+                      ),
                     ),
                   );
                 },
