@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_compass/flutter_compass.dart';
@@ -10,6 +11,9 @@ import '../providers/navigation_notifier.dart';
 import '../providers/navigation_state.dart';
 import '../widgets/navigation_steps_panel.dart';
 import '../widgets/user_location_marker.dart';
+
+/// Zoom predeterminado para navegación a pie.
+const double _kNavZoom = 18.0;
 
 class NavigationScreen extends ConsumerStatefulWidget {
   final int placeId;
@@ -32,21 +36,24 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   /// Cuando es true el mapa sigue al usuario y rota con la brújula.
   bool _followUser = true;
 
-  /// Última posición conocida — usada como punto de partida de la animación.
+  /// Última posición conocida — punto de partida de la animación del marcador.
   LatLng? _lastPosition;
 
-  /// Último heading de la brújula (grados desde el norte, sentido horario).
-  double _bearing = 0.0;
+  /// Heading actual del dispositivo (0-360°, desde el norte magnético).
+  /// ValueNotifier para que solo el icono de la brújula se reconstruya.
+  final ValueNotifier<double> _bearingNotifier = ValueNotifier(0.0);
 
-  /// Controller del panel inferior — permite escuchar cambios de tamaño
-  /// directamente, sin depender del bubbling de notificaciones.
+  /// Controller del panel inferior.
   final DraggableScrollableController _sheetController =
       DraggableScrollableController();
 
-  /// True mientras el panel está en movimiento; bloquea que el desborde
-  /// de gestos del panel apague la brújula en el mapa.
-  bool _panelMoving = false;
-  Timer? _panelMoveTimer;
+  /// Timer para detectar el fin del arrastre del panel.
+  Timer? _sheetSettleTimer;
+
+  /// Timer para re-activar la brújula tras soltar un gesto de
+  /// dos dedos (zoom / rotación). Se cancela si el usuario hace
+  /// un deslizamiento con un dedo (alejándose intencionalmente).
+  Timer? _gestureResumeTimer;
 
   StreamSubscription<CompassEvent>? _compassSub;
 
@@ -54,19 +61,13 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   void initState() {
     super.initState();
 
-    // Escucha cambios del panel: mientras se arrastra, bloquea que
-    // el desborde de gestos apague la brújula. Al llegar al mínimo
-    // (mapa "maximizado") reactiva seguimiento y brújula.
     _sheetController.addListener(_onSheetChanged);
 
-    // Escucha la brújula del dispositivo y rota el mapa en tiempo real.
     _compassSub = FlutterCompass.events?.listen((event) {
       if (event.heading == null || !mounted) return;
-      _bearing = event.heading!;
+      _bearingNotifier.value = event.heading!;
       if (_followUser) {
-        // flutter_map rota en sentido horario; negamos el heading para que
-        // la dirección del usuario quede siempre apuntando hacia arriba.
-        _mapController.rotate(-_bearing);
+        _mapController.rotate(-event.heading!);
       }
     });
 
@@ -77,37 +78,51 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
     });
   }
 
+  /// Llamado en cada cambio de tamaño del panel.
+  /// Cuando el panel deja de moverse (350 ms sin cambios), reactiva
+  /// la brújula y el seguimiento — tanto si el panel quedó en su
+  /// mínimo (mapa grande) como en su máximo (panel grande).
   void _onSheetChanged() {
-    // Cada vez que el panel cambia de tamaño marcamos que está en movimiento
-    // y reiniciamos el timer que lo desmarca 400ms después de que se detenga.
-    _panelMoving = true;
-    _panelMoveTimer?.cancel();
-    _panelMoveTimer = Timer(const Duration(milliseconds: 400), () {
-      _panelMoving = false;
+    _sheetSettleTimer?.cancel();
+    _sheetSettleTimer = Timer(const Duration(milliseconds: 350), () {
+      _resumeCompass();
     });
-
-    // Cuando el panel llega a su mínimo (mapa "maximizado") reactivamos
-    // seguimiento y brújula, igual que al pulsar el botón mi ubicación.
-    if (_sheetController.size <= 0.13) {
-      final pos = ref.read(navigationNotifierProvider).currentPosition;
-      if (pos != null) _toggleFollow(pos);
-    }
   }
 
   @override
   void dispose() {
-    _panelMoveTimer?.cancel();
+    _sheetSettleTimer?.cancel();
+    _gestureResumeTimer?.cancel();
     _sheetController.removeListener(_onSheetChanged);
     _sheetController.dispose();
     _compassSub?.cancel();
+    _bearingNotifier.dispose();
     ref.read(navigationNotifierProvider.notifier).stopNavigation();
     super.dispose();
   }
 
+  /// Activa seguimiento GPS + brújula y centra el mapa a zoom 18.
+  /// Usar solo para el botón "mi ubicación" (re-centrado explícito).
   void _toggleFollow(LatLng currentPosition) {
     setState(() => _followUser = true);
-    _mapController.move(currentPosition, _mapController.camera.zoom);
-    _mapController.rotate(-_bearing);
+    _mapController.move(currentPosition, _kNavZoom);
+    _mapController.rotate(-_bearingNotifier.value);
+  }
+
+  /// Re-activa la brújula y el seguimiento GPS SIN cambiar el zoom
+  /// ni re-centrar el mapa. Se usa tras gestos de dos dedos o al
+  /// mover el panel, para que el usuario no pierda el nivel de zoom
+  /// que eligió al hacer pinch.
+  void _resumeCompass() {
+    if (!mounted) return;
+    setState(() => _followUser = true);
+    _mapController.rotate(-_bearingNotifier.value);
+  }
+
+  /// Resetea la rotación a norte arriba y desactiva la auto-rotación.
+  void _resetNorth() {
+    setState(() => _followUser = false);
+    _mapController.rotate(0);
   }
 
   @override
@@ -120,14 +135,13 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
       if (!_hasCenteredOnce && next.route != null) {
         _hasCenteredOnce = true;
         setState(() => _lastPosition = next.currentPosition);
-        _mapController.move(next.currentPosition!, 18);
+        _mapController.move(next.currentPosition!, _kNavZoom);
       } else if (next.currentPosition != previous?.currentPosition) {
-        // Guardamos la posición anterior como punto de inicio de la animación.
         setState(() {
-          _lastPosition =
-              previous?.currentPosition ?? next.currentPosition;
+          _lastPosition = previous?.currentPosition ?? next.currentPosition;
         });
         if (_followUser) {
+          // Preserva el zoom que el usuario eligió; solo mueve la posición.
           _mapController.move(
             next.currentPosition!,
             _mapController.camera.zoom,
@@ -156,14 +170,12 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
         NavigationStatus.idle || NavigationStatus.loadingRoute => const Center(
           child: CircularProgressIndicator(),
         ),
-
         NavigationStatus.error => _ErrorView(
           message: navState.errorMessage ?? 'Ocurrió un error inesperado.',
           onRetry: () => ref
               .read(navigationNotifierProvider.notifier)
               .startNavigation(placeId: widget.placeId),
         ),
-
         NavigationStatus.navigating ||
         NavigationStatus.arrived => _buildMap(navState),
       },
@@ -179,25 +191,64 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
         .toList();
 
     final destination = routePoints.last;
-
-    // Punto de inicio de la animación: posición anterior si existe,
-    // o la posición actual (sin movimiento visible en el primer frame).
     final animFrom = _lastPosition ?? currentPosition;
 
     return Stack(
       children: [
+        // ── Mapa ────────────────────────────────────────────────────────────
         FlutterMap(
           mapController: _mapController,
           options: MapOptions(
             initialCenter: currentPosition,
-            initialZoom: 18,
+            initialZoom: _kNavZoom,
             interactionOptions: const InteractionOptions(
               flags: InteractiveFlag.all,
+              // Zoom y rotación se reconocen simultáneamente.
+              enableMultiFingerGestureRace: true,
+              // Umbrales bajos para respuesta inmediata en Huawei/HiTouch.
+              rotationThreshold: 5.0,
+              pinchZoomThreshold: 0.2,
+              pinchMoveThreshold: 20.0,
             ),
-            onTap: (_, __) {},
+            onTap: (tapPos, latLng) {},
+            onMapEvent: (event) {
+              final src = event.source;
+
+              // ── Pausar brújula al inicio de cualquier gesto ──────────────
+              if (_followUser &&
+                  (src == MapEventSource.multiFingerGestureStart ||
+                      src == MapEventSource.onMultiFinger ||
+                      src == MapEventSource.dragStart ||
+                      src == MapEventSource.onDrag)) {
+                _followUser = false;
+                setState(() {});
+              }
+
+              // ── Dos dedos: re-activar brújula 800 ms tras soltar ─────────
+              // Cada evento de dos dedos reinicia el timer; cuando el
+              // usuario levanta los dedos el timer ya no se resetea y
+              // 800 ms después la brújula vuelve sola SIN cambiar zoom.
+              if (src == MapEventSource.multiFingerGestureStart ||
+                  src == MapEventSource.onMultiFinger) {
+                _gestureResumeTimer?.cancel();
+                _gestureResumeTimer = Timer(
+                  const Duration(milliseconds: 800),
+                  _resumeCompass,
+                );
+              }
+
+              // ── Un dedo (pan): cancela la re-activación pendiente ────────
+              // El usuario se alejó intencionalmente; la brújula queda
+              // desactivada hasta que pulse el botón o mueva el panel.
+              if (src == MapEventSource.dragStart) {
+                _gestureResumeTimer?.cancel();
+              }
+            },
+            // Respaldo para gestos no capturados por onMapEvent.
             onPositionChanged: (camera, hasGesture) {
-              if (hasGesture && _followUser && !_panelMoving) {
-                setState(() => _followUser = false);
+              if (hasGesture && _followUser) {
+                _followUser = false;
+                setState(() {});
               }
             },
           ),
@@ -215,8 +266,6 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                 ),
               ],
             ),
-            // Animamos el marcador de usuario desde la posición anterior
-            // a la nueva — da la sensación de deslizamiento suave.
             TweenAnimationBuilder<LatLng>(
               key: ValueKey(
                 '${currentPosition.latitude}_${currentPosition.longitude}',
@@ -284,8 +333,47 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
           ],
         ),
 
+        // ── Banner llegada ───────────────────────────────────────────────────
         if (navState.status == NavigationStatus.arrived) const _ArrivedBanner(),
 
+        // ── Botón brújula (esquina superior derecha) ─────────────────────────
+        Positioned(
+          top: 16,
+          right: 16,
+          child: ValueListenableBuilder<double>(
+            valueListenable: _bearingNotifier,
+            builder: (context, bearing, _) {
+              return GestureDetector(
+                onTap: _resetNorth,
+                child: Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    shape: BoxShape.circle,
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Colors.black26,
+                        blurRadius: 6,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: Transform.rotate(
+                    angle: bearing * math.pi / 180,
+                    child: const Icon(
+                      Icons.navigation,
+                      color: Colors.red,
+                      size: 24,
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+
+        // ── Botón mi ubicación ───────────────────────────────────────────────
         Positioned(
           right: 16,
           bottom: 220,
@@ -304,29 +392,18 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
           ),
         ),
 
-        // El Listener activa _panelMoving en el instante que el dedo
-        // toca el panel — incluso cuando el sheet ya está en su límite
-        // y rechaza el gesto inmediatamente sin cambiar de tamaño.
-        // Esto garantiza que el desborde al mapa siempre quede bloqueado.
-        Listener(
-          behavior: HitTestBehavior.translucent,
-          onPointerDown: (_) {
-            _panelMoving = true;
-            _panelMoveTimer?.cancel();
-            _panelMoveTimer = Timer(const Duration(milliseconds: 600), () {
-              _panelMoving = false;
-            });
-          },
-          child: NavigationStepsPanel(
-            route: route,
-            status: navState.status,
-            sheetController: _sheetController,
-          ),
+        // ── Panel de pasos ───────────────────────────────────────────────────
+        NavigationStepsPanel(
+          route: route,
+          status: navState.status,
+          sheetController: _sheetController,
         ),
       ],
     );
   }
 }
+
+// ── Widgets auxiliares ───────────────────────────────────────────────────────
 
 class _ErrorView extends StatelessWidget {
   final String message;
