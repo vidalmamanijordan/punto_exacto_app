@@ -34,34 +34,61 @@ class NavigationStepsPanel extends StatelessWidget {
               ),
             ],
           ),
-          child: ListView(
-            controller: scrollController,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Column(
             children: [
-              Center(
-                child: Container(
-                  width: 40,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 12),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade300,
-                    borderRadius: BorderRadius.circular(2),
+              // ── Tirador fijo — siempre visible, nunca se scrollea ──────────
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade300,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
                 ),
               ),
 
-              _SummaryRow(route: route, status: status),
+              // ── Contenido scrollable ───────────────────────────────────────
+              Expanded(
+                child: CustomScrollView(
+                  controller: scrollController,
+                  slivers: [
+                    SliverPadding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      sliver: SliverList(
+                        delegate: SliverChildListDelegate([
+                          _SummaryRow(route: route, status: status),
+                          const Divider(height: 24),
+                          ...route.steps.map(
+                            (step) => ListTile(
+                              dense: true,
+                              leading: const Icon(
+                                Icons.directions_walk,
+                                size: 20,
+                              ),
+                              title: Text(step.instruction),
+                              trailing: step.distance > 0
+                                  ? Text('${step.distance.round()}m')
+                                  : null,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                        ]),
+                      ),
+                    ),
 
-              const Divider(height: 24),
-
-              ...route.steps.map(
-                (step) => ListTile(
-                  dense: true,
-                  leading: const Icon(Icons.directions_walk, size: 20),
-                  title: Text(step.instruction),
-                  trailing: step.distance > 0
-                      ? Text('${step.distance.round()}m')
-                      : null,
+                    // Imagen que llena TODO el espacio restante
+                    SliverFillRemaining(
+                      hasScrollBody: false,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                        child: _PlaceImage(imageUrl: route.place.image),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -161,6 +188,52 @@ class _PlaceThumbnail extends StatelessWidget {
             )
           : Icon(
               Icons.apartment,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+    );
+  }
+}
+
+/// Imagen grande del lugar destino que ocupa el ancho completo del panel.
+/// Permite al usuario confirmar visualmente que es el lugar correcto.
+class _PlaceImage extends StatelessWidget {
+  final String? imageUrl;
+
+  const _PlaceImage({required this.imageUrl});
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: SizedBox(
+        width: double.infinity,
+        height: double.infinity,
+        child: (imageUrl == null || imageUrl!.isEmpty)
+            ? _placeholder(context)
+            : Image.network(
+                imageUrl!,
+                fit: BoxFit.cover,
+                loadingBuilder: (context, child, progress) {
+                  if (progress == null) return child;
+                  return _placeholder(context, loading: true);
+                },
+                errorBuilder: (context, error, stackTrace) {
+                  return _placeholder(context);
+                },
+              ),
+      ),
+    );
+  }
+
+  Widget _placeholder(BuildContext context, {bool loading = false}) {
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      alignment: Alignment.center,
+      child: loading
+          ? const CircularProgressIndicator()
+          : Icon(
+              Icons.image_not_supported_outlined,
+              size: 48,
               color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
     );

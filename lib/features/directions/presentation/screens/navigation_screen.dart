@@ -33,8 +33,13 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   final MapController _mapController = MapController();
   bool _hasCenteredOnce = false;
 
-  /// Cuando es true el mapa sigue al usuario y rota con la brújula.
-  bool _followUser = true;
+  /// El mapa rota según la brújula del dispositivo.
+  bool _followBearing = true;
+
+  /// Offset de rotación elegido por el usuario con dos dedos (grados).
+  /// Permite que la brújula siga activa pero desde el ángulo preferido.
+  /// Fórmula: rotación_mapa = -compass_heading + _rotationOffset
+  double _rotationOffset = 0.0;
 
   /// Última posición conocida — punto de partida de la animación del marcador.
   LatLng? _lastPosition;
@@ -50,9 +55,8 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   /// Timer para detectar el fin del arrastre del panel.
   Timer? _sheetSettleTimer;
 
-  /// Timer para re-activar la brújula tras soltar un gesto de
-  /// dos dedos (zoom / rotación). Se cancela si el usuario hace
-  /// un deslizamiento con un dedo (alejándose intencionalmente).
+  /// Timer para re-activar la brújula 300 ms después de soltar
+  /// un gesto de dos dedos (zoom/rotación).
   Timer? _gestureResumeTimer;
 
   StreamSubscription<CompassEvent>? _compassSub;
@@ -66,8 +70,8 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
     _compassSub = FlutterCompass.events?.listen((event) {
       if (event.heading == null || !mounted) return;
       _bearingNotifier.value = event.heading!;
-      if (_followUser) {
-        _mapController.rotate(-event.heading!);
+      if (_followBearing) {
+        _mapController.rotate(-event.heading! + _rotationOffset);
       }
     });
 
@@ -78,10 +82,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
     });
   }
 
-  /// Llamado en cada cambio de tamaño del panel.
-  /// Cuando el panel deja de moverse (350 ms sin cambios), reactiva
-  /// la brújula y el seguimiento — tanto si el panel quedó en su
-  /// mínimo (mapa grande) como en su máximo (panel grande).
+  /// Cuando el panel deja de moverse (350 ms sin cambios), reactiva la brújula.
   void _onSheetChanged() {
     _sheetSettleTimer?.cancel();
     _sheetSettleTimer = Timer(const Duration(milliseconds: 350), () {
@@ -101,28 +102,39 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
     super.dispose();
   }
 
-  /// Activa seguimiento GPS + brújula y centra el mapa a zoom 18.
-  /// Usar solo para el botón "mi ubicación" (re-centrado explícito).
+  /// Botón "mi ubicación": resetea offset, reactiva brújula pura, re-centra.
   void _toggleFollow(LatLng currentPosition) {
-    setState(() => _followUser = true);
+    _rotationOffset = 0.0;
+    setState(() => _followBearing = true);
     _mapController.move(currentPosition, _kNavZoom);
     _mapController.rotate(-_bearingNotifier.value);
   }
 
-  /// Re-activa la brújula y el seguimiento GPS SIN cambiar el zoom
-  /// ni re-centrar el mapa. Se usa tras gestos de dos dedos o al
-  /// mover el panel, para que el usuario no pierda el nivel de zoom
-  /// que eligió al hacer pinch.
+  /// Reactiva la brújula preservando el ángulo que el usuario eligió.
+  /// Captura el offset entre la rotación actual del mapa y el heading
+  /// de la brújula, para que el mapa siga girando desde esa posición.
   void _resumeCompass() {
     if (!mounted) return;
-    setState(() => _followUser = true);
-    _mapController.rotate(-_bearingNotifier.value);
+    // offset = rotación_actual - lo_que_la_brújula_hubiera_puesto
+    _rotationOffset =
+        _mapController.camera.rotation - (-_bearingNotifier.value);
+    setState(() => _followBearing = true);
+    _mapController.rotate(-_bearingNotifier.value + _rotationOffset);
   }
 
-  /// Resetea la rotación a norte arriba y desactiva la auto-rotación.
-  void _resetNorth() {
-    setState(() => _followUser = false);
-    _mapController.rotate(0);
+  /// Botón brújula: alterna entre heading-up y norte-arriba.
+  void _toggleNorth() {
+    if (_followBearing) {
+      // Heading-up → Norte arriba
+      _rotationOffset = 0.0;
+      setState(() => _followBearing = false);
+      _mapController.rotate(0);
+    } else {
+      // Norte arriba → Heading-up
+      _rotationOffset = 0.0;
+      setState(() => _followBearing = true);
+      _mapController.rotate(-_bearingNotifier.value);
+    }
   }
 
   @override
@@ -140,13 +152,8 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
         setState(() {
           _lastPosition = previous?.currentPosition ?? next.currentPosition;
         });
-        if (_followUser) {
-          // Preserva el zoom que el usuario eligió; solo mueve la posición.
-          _mapController.move(
-            next.currentPosition!,
-            _mapController.camera.zoom,
-          );
-        }
+        // El mapa SIEMPRE sigue la posición GPS; preserva el zoom del usuario.
+        _mapController.move(next.currentPosition!, _mapController.camera.zoom);
       }
 
       if (next.status == NavigationStatus.arrived &&
@@ -214,42 +221,22 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
             onMapEvent: (event) {
               final src = event.source;
 
-              // ── Pausar brújula al inicio de cualquier gesto ──────────────
-              if (_followUser &&
-                  (src == MapEventSource.multiFingerGestureStart ||
-                      src == MapEventSource.onMultiFinger ||
-                      src == MapEventSource.dragStart ||
-                      src == MapEventSource.onDrag)) {
-                _followUser = false;
-                setState(() {});
-              }
-
-              // ── Dos dedos: re-activar brújula 800 ms tras soltar ─────────
-              // Cada evento de dos dedos reinicia el timer; cuando el
-              // usuario levanta los dedos el timer ya no se resetea y
-              // 800 ms después la brújula vuelve sola SIN cambiar zoom.
+              // ── Dos dedos (zoom / rotación) ──────────────────────────────
+              // Pausa la brújula durante el gesto y la reactiva 300 ms
+              // después de soltar — modo heading-up siempre activo.
               if (src == MapEventSource.multiFingerGestureStart ||
                   src == MapEventSource.onMultiFinger) {
+                if (_followBearing) setState(() => _followBearing = false);
                 _gestureResumeTimer?.cancel();
                 _gestureResumeTimer = Timer(
-                  const Duration(milliseconds: 800),
+                  const Duration(milliseconds: 300),
                   _resumeCompass,
                 );
               }
 
-              // ── Un dedo (pan): cancela la re-activación pendiente ────────
-              // El usuario se alejó intencionalmente; la brújula queda
-              // desactivada hasta que pulse el botón o mueva el panel.
-              if (src == MapEventSource.dragStart) {
-                _gestureResumeTimer?.cancel();
-              }
-            },
-            // Respaldo para gestos no capturados por onMapEvent.
-            onPositionChanged: (camera, hasGesture) {
-              if (hasGesture && _followUser) {
-                _followUser = false;
-                setState(() {});
-              }
+              // ── Un dedo (pan) ────────────────────────────────────────────
+              // La brújula sigue activa; el GPS devuelve el mapa a tu
+              // posición en la próxima actualización.
             },
           ),
           children: [
@@ -337,14 +324,17 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
         if (navState.status == NavigationStatus.arrived) const _ArrivedBanner(),
 
         // ── Botón brújula (esquina superior derecha) ─────────────────────────
+        // Heading-up: ícono rota con el bearing, color rojo (activo).
+        // Norte-arriba: ícono fijo apuntando al norte, color gris (inactivo).
         Positioned(
           top: 16,
           right: 16,
           child: ValueListenableBuilder<double>(
             valueListenable: _bearingNotifier,
             builder: (context, bearing, _) {
+              final isHeadingUp = _followBearing;
               return GestureDetector(
-                onTap: _resetNorth,
+                onTap: _toggleNorth,
                 child: Container(
                   width: 44,
                   height: 44,
@@ -360,10 +350,11 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                     ],
                   ),
                   child: Transform.rotate(
-                    angle: bearing * math.pi / 180,
-                    child: const Icon(
+                    // En heading-up rota con el bearing; en norte-arriba queda fijo.
+                    angle: isHeadingUp ? bearing * math.pi / 180 : 0.0,
+                    child: Icon(
                       Icons.navigation,
-                      color: Colors.red,
+                      color: isHeadingUp ? Colors.red : Colors.grey,
                       size: 24,
                     ),
                   ),
@@ -379,13 +370,13 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
           bottom: 220,
           child: FloatingActionButton(
             mini: true,
-            backgroundColor: _followUser
+            backgroundColor: _followBearing
                 ? Theme.of(context).colorScheme.primary
                 : Theme.of(context).colorScheme.surface,
             onPressed: () => _toggleFollow(currentPosition),
             child: Icon(
               Icons.my_location,
-              color: _followUser
+              color: _followBearing
                   ? Theme.of(context).colorScheme.onPrimary
                   : Theme.of(context).colorScheme.onSurface,
             ),
