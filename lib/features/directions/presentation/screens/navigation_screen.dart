@@ -244,15 +244,18 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
               urlTemplate: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
               userAgentPackageName: 'com.upeu.puntoexacto.punto_exacto_app',
             ),
-            PolylineLayer(
-              polylines: [
-                Polyline(
-                  points: routePoints,
-                  strokeWidth: 5,
-                  color: Colors.blueAccent,
-                ),
-              ],
-            ),
+            // Solo dibuja la ruta azul si el backend devolvió pasos reales.
+            // Sin pasos = fallback de línea recta = solo se muestran marcadores.
+            if (route.steps.isNotEmpty)
+              PolylineLayer(
+                polylines: [
+                  Polyline(
+                    points: routePoints,
+                    strokeWidth: 5,
+                    color: Colors.blueAccent,
+                  ),
+                ],
+              ),
             TweenAnimationBuilder<LatLng>(
               key: ValueKey(
                 '${currentPosition.latitude}_${currentPosition.longitude}',
